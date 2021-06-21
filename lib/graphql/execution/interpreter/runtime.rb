@@ -9,82 +9,69 @@ module GraphQL
       # @api private
       class Runtime
 
-        module GraphQLResult
-          # These methods are private concerns of GraphQL-Ruby,
-          # they aren't guaranteed to continue working in the future.
-          attr_accessor :graphql_dead, :graphql_parent, :graphql_result_name
-          # Although these are used by only one of the Result classes,
-          # it's handy to have the methods implemented on both (even though they just return `nil`)
-          # because it makes it easy to check if anything is assigned.
-          # @return [nil, Array<String>]
-          attr_accessor :graphql_non_null_field_names
-          # @return [nil, true]
-          attr_accessor :graphql_non_null_list_items
-        end
-
-        class GraphQLResultHash < Hash
-          include GraphQLResult
-
-          attr_accessor :graphql_merged_into
-
-          def []=(key, value)
-            # This is a hack.
-            # Basically, this object is merged into the root-level result at some point.
-            # But the problem is, some lazies are created whose closures retain reference to _this_
-            # object. When those lazies are resolved, they cause an update to this object.
-            #
-            # In order to return a proper top-level result, we have to update that top-level result object.
-            # In order to return a proper partial result (eg, for a directive), we have to update this object, too.
-            # Yowza.
-            if (t = @graphql_merged_into)
-              t[key] = value
-            end
-            super
+        module FastResults
+          module GraphQLResult
+            # These methods are private concerns of GraphQL-Ruby,
+            # they aren't guaranteed to continue working in the future.
+            attr_accessor :graphql_dead, :graphql_parent, :graphql_result_name
+            # Although these are used by only one of the Result classes,
+            # it's handy to have the methods implemented on both (even though they just return `nil`)
+            # because it makes it easy to check if anything is assigned.
+            # @return [nil, Array<String>]
+            attr_accessor :graphql_non_null_field_names
+            # @return [nil, true]
+            attr_accessor :graphql_non_null_list_items
           end
 
-          def graphql_to_built_in_data
-            plain_hash = {}
-            each do |k, v|
-              if v.respond_to?(:graphql_to_built_in_data)
-                plain_hash[k] = v.graphql_to_built_in_data
-              else
-                plain_hash[k] = v
+          refine Hash do
+            include GraphQLResult
+
+            attr_accessor :graphql_merged_into
+
+            def []=(key, value)
+              # This is a hack.
+              # Basically, this object is merged into the root-level result at some point.
+              # But the problem is, some lazies are created whose closures retain reference to _this_
+              # object. When those lazies are resolved, they cause an update to this object.
+              #
+              # In order to return a proper top-level result, we have to update that top-level result object.
+              # In order to return a proper partial result (eg, for a directive), we have to update this object, too.
+              # Yowza.
+              if (t = @graphql_merged_into)
+                t[key] = value
               end
+              super
             end
-            plain_hash
-          end
-        end
 
-        class GraphQLResultArray < Array
-          include GraphQLResult
-
-          def graphql_skip_at(index)
-            # Mark this index as dead. It's tricky because some indices may already be storing
-            # `Lazy`s. So the runtime is still holding indexes _before_ skipping,
-            # this object has to coordinate incoming writes to account for any already-skipped indices.
-            @skip_indices ||= []
-            @skip_indices << index
-            offset_by = @skip_indices.count { |skipped_idx| skipped_idx < index}
-            delete_at_index = index - offset_by
-            delete_at(delete_at_index)
+            # for selection sets
+            attr_accessor :graphql_directives
           end
 
-          def []=(idx, value)
-            if @skip_indices
-              offset_by = @skip_indices.count { |skipped_idx| skipped_idx < idx }
-              idx -= offset_by
+          refine Array do
+            include GraphQLResult
+
+            def graphql_skip_at(index)
+              # Mark this index as dead. It's tricky because some indices may already be storing
+              # `Lazy`s. So the runtime is still holding indexes _before_ skipping,
+              # this object has to coordinate incoming writes to account for any already-skipped indices.
+              @skip_indices ||= []
+              @skip_indices << index
+              offset_by = @skip_indices.count { |skipped_idx| skipped_idx < index}
+              delete_at_index = index - offset_by
+              delete_at(delete_at_index)
             end
-            super(idx, value)
-          end
 
-          def graphql_to_built_in_data
-            map { |item| item.respond_to?(:graphql_to_built_in_data) ? item.graphql_to_built_in_data : item }
+            def []=(idx, value)
+              if @skip_indices
+                offset_by = @skip_indices.count { |skipped_idx| skipped_idx < idx }
+                idx -= offset_by
+              end
+              super(idx, value)
+            end
           end
         end
 
-        class GraphQLSelectionSet < Hash
-          attr_accessor :graphql_directives
-        end
+        using FastResults
 
         # @return [GraphQL::Query]
         attr_reader :query
@@ -102,7 +89,7 @@ module GraphQL
           @context = query.context
           @multiplex_context = query.multiplex.context
           @interpreter_context = @context.namespace(:interpreter)
-          @response = GraphQLResultHash.new
+          @response = {}
           # Identify runtime directives by checking which of this schema's directives have overridden `def self.resolve`
           @runtime_directive_names = []
           noop_resolve_owner = GraphQL::Schema::Directive.singleton_class
@@ -120,7 +107,7 @@ module GraphQL
         end
 
         def final_result
-          @response && @response.graphql_to_built_in_data
+          @response
         end
 
         def inspect
@@ -164,7 +151,7 @@ module GraphQL
               # directly evaluated and the results can be written right into the main response hash.
               tap_or_each(gathered_selections) do |selections, is_selection_array|
                 if is_selection_array
-                  selection_response = GraphQLResultHash.new
+                  selection_response = {}
                   final_response = @response
                 else
                   selection_response = @response
@@ -218,7 +205,7 @@ module GraphQL
           nil
         end
 
-        def gather_selections(owner_object, owner_type, selections, selections_to_run = nil, selections_by_name = GraphQLSelectionSet.new)
+        def gather_selections(owner_object, owner_type, selections, selections_to_run = nil, selections_by_name = {})
           selections.each do |node|
             # Skip gathering this if the directive says so
             if !directives_include?(node, owner_object, owner_type)
@@ -244,7 +231,7 @@ module GraphQL
             else
               # This is an InlineFragment or a FragmentSpread
               if @runtime_directive_names.any? && node.directives.any? { |d| @runtime_directive_names.include?(d.name) }
-                next_selections = GraphQLSelectionSet.new
+                next_selections = {}
                 next_selections.graphql_directives = node.directives
                 if selections_to_run
                   selections_to_run << next_selections
@@ -638,7 +625,7 @@ module GraphQL
             after_lazy(object_proxy, owner: current_type, path: path, ast_node: ast_node, scoped_context: context.scoped_context, field: field, owner_object: owner_object, arguments: arguments, trace: false, result_name: result_name, result: selection_result) do |inner_object|
               continue_value = continue_value(path, inner_object, owner_type, field, is_non_null, ast_node, result_name, selection_result)
               if HALT != continue_value
-                response_hash = GraphQLResultHash.new
+                response_hash = {}
                 response_hash.graphql_parent = selection_result
                 response_hash.graphql_result_name = result_name
                 set_result(selection_result, result_name, response_hash)
@@ -653,7 +640,7 @@ module GraphQL
                 #    (Technically, it's possible that one of those entries _doesn't_ require isolation.)
                 tap_or_each(gathered_selections) do |selections, is_selection_array|
                   if is_selection_array
-                    this_result = GraphQLResultHash.new
+                    this_result = {}
                     this_result.graphql_parent = selection_result
                     this_result.graphql_result_name = result_name
                     final_result = response_hash
@@ -680,7 +667,7 @@ module GraphQL
             end
           when "LIST"
             inner_type = current_type.of_type
-            response_list = GraphQLResultArray.new
+            response_list = []
             response_list.graphql_non_null_list_items = inner_type.non_null?
             response_list.graphql_parent = selection_result
             response_list.graphql_result_name = result_name
